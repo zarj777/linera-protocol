@@ -3,7 +3,6 @@
 
 use std::{collections::VecDeque, fmt::Debug, marker::PhantomData};
 
-use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use test_case::test_case;
 
@@ -17,10 +16,11 @@ use crate::scylla_db::ScyllaDbStore;
 use crate::store::TestKeyValueStore;
 use crate::{
     batch::Batch,
-    context::{create_test_memory_context, Context, MemoryContext},
+    context::{Context, MemoryContext},
     queue_view::QueueView,
     reentrant_collection_view::ReentrantCollectionView,
     register_view::{HashedRegisterView, RegisterView},
+    store::WritableKeyValueStore as _,
     test_utils::test_views::{
         TestBucketQueueView, TestCollectionView, TestLogView, TestMapView, TestQueueView,
         TestRegisterView, TestSetView, TestView,
@@ -133,7 +133,7 @@ async fn run_test_queue_operations<C>(
     context: C,
 ) -> Result<(), anyhow::Error>
 where
-    C: Context + Clone + Send + Sync + 'static,
+    C: Context<Error: Send + Sync> + Clone + Send + Sync + 'static,
     ViewError: From<C::Error>,
 {
     let mut expected_state = VecDeque::new();
@@ -168,7 +168,7 @@ async fn check_queue_state<C>(
     expected_state: &VecDeque<usize>,
 ) -> Result<(), anyhow::Error>
 where
-    C: Context + Clone + Send + Sync,
+    C: Context<Error: Send + Sync> + Clone + Send + Sync,
     ViewError: From<C::Error>,
 {
     let count = expected_state.len();
@@ -187,21 +187,19 @@ fn check_contents(contents: Vec<usize>, expected: &VecDeque<usize>) {
     assert_eq!(&contents.into_iter().collect::<VecDeque<_>>(), expected);
 }
 
-#[async_trait]
 trait TestContextFactory {
-    type Context: Context + Clone + Send + Sync + 'static;
+    type Context: Context<Error: Send + Sync> + Clone + Send + Sync + 'static;
 
     async fn new_context(&mut self) -> Result<Self::Context, anyhow::Error>;
 }
 
 struct MemoryContextFactory;
 
-#[async_trait]
 impl TestContextFactory for MemoryContextFactory {
     type Context = MemoryContext<()>;
 
     async fn new_context(&mut self) -> Result<Self::Context, anyhow::Error> {
-        Ok(create_test_memory_context())
+        Ok(MemoryContext::new_for_testing(()))
     }
 }
 
@@ -209,15 +207,13 @@ impl TestContextFactory for MemoryContextFactory {
 struct RocksDbContextFactory;
 
 #[cfg(with_rocksdb)]
-#[async_trait]
 impl TestContextFactory for RocksDbContextFactory {
     type Context = ViewContext<(), RocksDbStore>;
 
     async fn new_context(&mut self) -> Result<Self::Context, anyhow::Error> {
         let config = RocksDbStore::new_test_config().await?;
         let namespace = generate_test_namespace();
-        let root_key = &[];
-        let store = RocksDbStore::recreate_and_connect(&config, &namespace, root_key).await?;
+        let store = RocksDbStore::recreate_and_connect(&config, &namespace).await?;
         let context = ViewContext::create_root_context(store, ()).await?;
 
         Ok(context)
@@ -228,15 +224,13 @@ impl TestContextFactory for RocksDbContextFactory {
 struct DynamoDbContextFactory;
 
 #[cfg(with_dynamodb)]
-#[async_trait]
 impl TestContextFactory for DynamoDbContextFactory {
     type Context = ViewContext<(), DynamoDbStore>;
 
     async fn new_context(&mut self) -> Result<Self::Context, anyhow::Error> {
         let config = DynamoDbStore::new_test_config().await?;
         let namespace = generate_test_namespace();
-        let root_key = &[];
-        let store = DynamoDbStore::recreate_and_connect(&config, &namespace, root_key).await?;
+        let store = DynamoDbStore::recreate_and_connect(&config, &namespace).await?;
         Ok(ViewContext::create_root_context(store, ()).await?)
     }
 }
@@ -245,15 +239,13 @@ impl TestContextFactory for DynamoDbContextFactory {
 struct ScyllaDbContextFactory;
 
 #[cfg(with_scylladb)]
-#[async_trait]
 impl TestContextFactory for ScyllaDbContextFactory {
     type Context = ViewContext<(), ScyllaDbStore>;
 
     async fn new_context(&mut self) -> Result<Self::Context, anyhow::Error> {
         let config = ScyllaDbStore::new_test_config().await?;
         let namespace = generate_test_namespace();
-        let root_key = &[];
-        let store = ScyllaDbStore::recreate_and_connect(&config, &namespace, root_key).await?;
+        let store = ScyllaDbStore::recreate_and_connect(&config, &namespace).await?;
         let context = ViewContext::create_root_context(store, ()).await?;
         Ok(context)
     }
@@ -274,7 +266,7 @@ async fn test_clone_includes_staged_changes<V>(
 where
     V: TestView,
 {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     let mut original = V::load(context).await?;
     let original_state = original.stage_initial_changes().await?;
 
@@ -301,7 +293,7 @@ async fn test_original_and_clone_stage_changes_separately<V>(
 where
     V: TestView,
 {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     let mut original = V::load(context).await?;
     original.stage_initial_changes().await?;
 
@@ -325,7 +317,7 @@ where
 /// Otherwise `rollback` may set the cached staged hash value to an incorrect value.
 #[tokio::test]
 async fn test_clearing_of_cached_stored_hash() -> anyhow::Result<()> {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     let mut view = HashedRegisterView::<_, String>::load(context.clone()).await?;
 
     let empty_hash = view.hash().await?;
@@ -365,7 +357,7 @@ async fn test_clearing_of_cached_stored_hash() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_reentrant_collection_view_has_no_pending_changes_after_try_load_entries(
 ) -> anyhow::Result<()> {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     let values = [(1, "first".to_owned()), (2, "second".to_owned())];
     let mut view =
         ReentrantCollectionView::<_, u8, RegisterView<_, String>>::load(context.clone()).await?;
@@ -392,7 +384,7 @@ async fn test_reentrant_collection_view_has_no_pending_changes_after_try_load_en
 #[tokio::test]
 async fn test_reentrant_collection_view_has_pending_changes_after_new_entry() -> anyhow::Result<()>
 {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     let values = [(1, "first".to_owned()), (2, "second".to_owned())];
     let mut view =
         ReentrantCollectionView::<_, u8, RegisterView<_, String>>::load(context.clone()).await?;
@@ -416,7 +408,7 @@ async fn test_reentrant_collection_view_has_pending_changes_after_new_entry() ->
 #[tokio::test]
 async fn test_reentrant_collection_view_has_pending_changes_after_try_load_entry_mut(
 ) -> anyhow::Result<()> {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     let values = [(1, "first".to_owned()), (2, "second".to_owned())];
     let mut view =
         ReentrantCollectionView::<_, u8, RegisterView<_, String>>::load(context.clone()).await?;
@@ -449,7 +441,7 @@ async fn test_reentrant_collection_view_has_pending_changes_after_try_load_entry
 #[tokio::test]
 async fn test_reentrant_collection_view_has_pending_changes_after_try_load_entries_mut(
 ) -> anyhow::Result<()> {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     let values = [
         (1, "first".to_owned()),
         (2, "second".to_owned()),
@@ -497,7 +489,7 @@ async fn test_reentrant_collection_view_has_pending_changes_after_try_load_entri
 #[test_case(PhantomData::<TestRegisterView<_>>; "with RegisterView")]
 #[tokio::test]
 async fn test_flushing_cleared_view<V: TestView>(_view_type: PhantomData<V>) -> anyhow::Result<()> {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     let mut view = V::load(context.clone()).await?;
 
     assert!(!view.has_pending_changes().await);
@@ -513,11 +505,11 @@ async fn test_flushing_cleared_view<V: TestView>(_view_type: PhantomData<V>) -> 
 /// Saves a [`View`] into the [`MemoryContext<()>`] storage simulation.
 async fn save_view<C>(context: &C, view: &mut impl View<C>) -> anyhow::Result<()>
 where
-    C: Context,
+    C: Context<Error: Send + Sync>,
 {
     let mut batch = Batch::new();
     view.flush(&mut batch)?;
-    context.write_batch(batch).await?;
+    context.store().write_batch(batch).await?;
     Ok(())
 }
 

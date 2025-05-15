@@ -9,15 +9,16 @@ use std::{
 
 use futures::{future::Either, stream, StreamExt as _, TryStreamExt as _};
 use linera_base::{
-    data_types::{ArithmeticError, Blob, BlockHeight, UserApplicationDescription},
-    identifiers::{BlobId, ChainId, MessageId, UserApplicationId},
+    crypto::ValidatorPublicKey,
+    data_types::{ApplicationDescription, ArithmeticError, Blob, BlockHeight, Epoch},
+    identifiers::{ApplicationId, BlobId, ChainId},
 };
 use linera_chain::{
-    data_types::{BlockProposal, ExecutedBlock, ProposedBlock},
-    types::{ConfirmedBlockCertificate, GenericCertificate, LiteCertificate},
+    data_types::{BlockProposal, ProposedBlock},
+    types::{Block, GenericCertificate, LiteCertificate},
     ChainStateView,
 };
-use linera_execution::{committee::ValidatorName, Query, Response};
+use linera_execution::{committee::Committee, Query, QueryOutcome};
 use linera_storage::Storage;
 use linera_views::views::ViewError;
 use thiserror::Error;
@@ -25,7 +26,7 @@ use tokio::sync::OwnedRwLockReadGuard;
 use tracing::{instrument, warn};
 
 use crate::{
-    data_types::{BlockHeightRange, ChainInfo, ChainInfoQuery, ChainInfoResponse},
+    data_types::{ChainInfo, ChainInfoQuery, ChainInfoResponse},
     notifier::Notifier,
     worker::{ProcessableCertificate, WorkerError, WorkerState},
 };
@@ -174,8 +175,14 @@ where
     pub async fn stage_block_execution(
         &self,
         block: ProposedBlock,
-    ) -> Result<(ExecutedBlock, ChainInfoResponse), LocalNodeError> {
-        Ok(self.node.state.stage_block_execution(block).await?)
+        round: Option<u32>,
+        published_blobs: Vec<Blob>,
+    ) -> Result<(Block, ChainInfoResponse), LocalNodeError> {
+        Ok(self
+            .node
+            .state
+            .stage_block_execution(block, round, published_blobs)
+            .await?)
     }
 
     /// Reads blobs from storage.
@@ -187,17 +194,17 @@ where
         Ok(storage.read_blobs(blob_ids).await?.into_iter().collect())
     }
 
-    /// Looks for the specified blobs in the local chain manager's locked blobs.
+    /// Looks for the specified blobs in the local chain manager's locking blobs.
     /// Returns `Ok(None)` if any of the blobs is not found.
-    pub async fn get_locked_blobs(
+    pub async fn get_locking_blobs(
         &self,
-        blob_ids: &[BlobId],
+        blob_ids: impl IntoIterator<Item = &BlobId>,
         chain_id: ChainId,
     ) -> Result<Option<Vec<Blob>>, LocalNodeError> {
         let chain = self.chain_state_view(chain_id).await?;
         let mut blobs = Vec::new();
         for blob_id in blob_ids {
-            match chain.manager.locked_blobs.get(blob_id).await? {
+            match chain.manager.locking_blobs.get(blob_id).await? {
                 None => return Ok(None),
                 Some(blob) => blobs.push(blob),
             }
@@ -250,45 +257,23 @@ where
         &self,
         chain_id: ChainId,
         query: Query,
-    ) -> Result<Response, LocalNodeError> {
-        let response = self.node.state.query_application(chain_id, query).await?;
-        Ok(response)
+    ) -> Result<QueryOutcome, LocalNodeError> {
+        let outcome = self.node.state.query_application(chain_id, query).await?;
+        Ok(outcome)
     }
 
     #[instrument(level = "trace", skip(self))]
     pub async fn describe_application(
         &self,
         chain_id: ChainId,
-        application_id: UserApplicationId,
-    ) -> Result<UserApplicationDescription, LocalNodeError> {
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, LocalNodeError> {
         let response = self
             .node
             .state
             .describe_application(chain_id, application_id)
             .await?;
         Ok(response)
-    }
-
-    /// Obtains the certificate containing the specified message.
-    #[instrument(level = "trace", skip(self))]
-    pub async fn certificate_for(
-        &self,
-        message_id: &MessageId,
-    ) -> Result<ConfirmedBlockCertificate, LocalNodeError> {
-        let query = ChainInfoQuery::new(message_id.chain_id)
-            .with_sent_certificate_hashes_in_range(BlockHeightRange::single(message_id.height));
-        let info = self.handle_chain_info_query(query).await?.info;
-        let certificates = self
-            .storage_client()
-            .read_certificates(info.requested_sent_certificate_hashes)
-            .await?;
-        let certificate = certificates
-            .into_iter()
-            .find(|certificate| certificate.has_message(message_id))
-            .ok_or_else(|| {
-                ViewError::not_found("could not find certificate with message {}", message_id)
-            })?;
-        Ok(certificate)
     }
 
     /// Handles any pending local cross-chain requests.
@@ -335,12 +320,47 @@ where
     pub async fn update_received_certificate_trackers(
         &self,
         chain_id: ChainId,
-        new_trackers: BTreeMap<ValidatorName, u64>,
+        new_trackers: BTreeMap<ValidatorPublicKey, u64>,
     ) -> Result<(), LocalNodeError> {
         self.node
             .state
             .update_received_certificate_trackers(chain_id, new_trackers)
             .await?;
         Ok(())
+    }
+}
+
+/// Extension trait for [`ChainInfo`]s from our local node. These should always be valid and
+/// contain the requested information.
+pub trait LocalChainInfoExt {
+    /// Returns the requested map of committees.
+    fn into_committees(self) -> Result<BTreeMap<Epoch, Committee>, LocalNodeError>;
+
+    /// Returns the current committee.
+    fn into_current_committee(self) -> Result<Committee, LocalNodeError>;
+
+    /// Returns a reference to the current committee.
+    fn current_committee(&self) -> Result<&Committee, LocalNodeError>;
+}
+
+impl LocalChainInfoExt for ChainInfo {
+    fn into_committees(self) -> Result<BTreeMap<Epoch, Committee>, LocalNodeError> {
+        self.requested_committees
+            .ok_or(LocalNodeError::InvalidChainInfoResponse)
+    }
+
+    fn into_current_committee(self) -> Result<Committee, LocalNodeError> {
+        self.requested_committees
+            .ok_or(LocalNodeError::InvalidChainInfoResponse)?
+            .remove(&self.epoch)
+            .ok_or(LocalNodeError::InactiveChain(self.chain_id))
+    }
+
+    fn current_committee(&self) -> Result<&Committee, LocalNodeError> {
+        self.requested_committees
+            .as_ref()
+            .ok_or(LocalNodeError::InvalidChainInfoResponse)?
+            .get(&self.epoch)
+            .ok_or(LocalNodeError::InactiveChain(self.chain_id))
     }
 }

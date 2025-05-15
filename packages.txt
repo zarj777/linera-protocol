@@ -17,5 +17,7 @@ linera-sdk-derive
 linera-sdk
 linera-rpc
 linera-client
+linera-faucet-client
+linera-faucet-server
 linera-service
 linera-service-graphql-client
